@@ -1,0 +1,151 @@
+Metadata-Version: 2.4
+Name: difflog
+Version: 0.1.0
+Summary: Semantic changelog generator powered by git diffs and LLMs
+License: MIT
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: click>=8.1
+Requires-Dist: gitpython>=3.1
+Requires-Dist: anthropic>=0.25
+Requires-Dist: rich>=13.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: pytest-mock>=3.12; extra == "dev"
+
+# difflog
+
+**Semantic changelog generator powered by git diffs and LLMs.**
+
+`difflog` analyzes what changed between two git refs at a _semantic_ level — not just "these lines changed" — and produces a structured, AI-summarized `CHANGELOG.md`.
+
+```
+difflog --from v1.0.0 --to v1.2.0 --output CHANGELOG.md
+difflog --from main --to dev --format markdown
+difflog --from HEAD~10 --to HEAD --no-llm   # offline fallback
+```
+
+---
+
+## Features
+
+- **AST-based Python analysis** — detects added/removed/renamed functions and classes, not just line diffs
+- **Smart classification** — rule-based heuristics first (fast, deterministic), LLM second for ambiguous cases
+- **Token-efficient LLM calls** — sends structured semantic context, not raw diffs
+- **Keep a Changelog format** — sections: Breaking Changes · Features · Bug Fixes · Refactors · Chores
+- **Offline mode** — `--no-llm` produces rule-based summaries with no API calls
+- **JSON output** — `--format json` for programmatic consumption
+
+---
+
+## Installation
+
+```bash
+# From source (recommended during development)
+pip install -e ".[dev]"
+
+# Set your Anthropic API key
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+**Requirements:** Python 3.10+, git
+
+---
+
+## Usage
+
+```bash
+# Basic — compare two version tags
+difflog --from v1.0.0 --to v1.2.0
+
+# Write to file
+difflog --from v1.0.0 --to v1.2.0 --output CHANGELOG.md
+
+# Compare branches
+difflog --from main --to feature/my-branch
+
+# Offline mode (no API key needed)
+difflog --from HEAD~10 --to HEAD --no-llm
+
+# Verbose: show per-file classification table
+difflog --from v1.0.0 --to v1.2.0 --verbose
+
+# JSON output (pipe to jq, etc.)
+difflog --from v1.0.0 --to v1.2.0 --format json | jq .
+
+# Custom version label in the changelog header
+difflog --from v1.0.0 --to HEAD --version-label "2.0.0-beta"
+
+# Point at a different repo
+difflog --from v1.0.0 --to v1.1.0 --repo /path/to/other/repo
+```
+
+---
+
+## Architecture
+
+```
+difflog/
+├── cli.py              # Click CLI — orchestrates the pipeline
+├── git_interface.py    # gitpython wrapper: commits, diffs, file stats
+├── semantic_parser.py  # AST analysis (Python) + heuristics (all others)
+├── classifier.py       # Rule-based + LLM-assisted change labelling
+├── llm_summarizer.py   # Anthropic API integration (token-efficient)
+└── renderer.py         # CHANGELOG.md (Keep a Changelog format)
+```
+
+### Pipeline
+
+```
+git refs
+    │
+    ▼
+GitInterface          → DiffResult (commits + FileDiffs)
+    │
+    ▼
+SemanticParser        → SemanticFileSummary[] (symbol changes, significance)
+    │
+    ▼
+ChangeClassifier      → ClassifiedChange[] (breaking/feature/bugfix/refactor/chore)
+    │
+    ▼
+LLMSummarizer         → LLMSummary (per-file one-liners + release paragraph)
+    │
+    ▼
+ChangelogRenderer     → CHANGELOG.md / JSON
+```
+
+### Change labels
+
+| Label | Triggered by |
+|---|---|
+| `breaking` | Public function/class removed or renamed; file deleted |
+| `feature` | New file; new public function/class added |
+| `bugfix` | `fix:` commit prefix; bug/patch keywords |
+| `refactor` | Only renames; `refactor:` commit prefix |
+| `chore` | Config/infra paths (CI, lockfiles, docs) |
+
+---
+
+## Running tests
+
+```bash
+pytest tests/ -v
+```
+
+---
+
+## Environment variables
+
+| Variable | Required | Description |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | Yes (unless `--no-llm`) | Anthropic API key |
+
+---
+
+## Extending difflog
+
+- **Add a new language parser** — subclass or extend `SemanticParser._parse_generic` and add an `elif fd.extension == ".go":` branch with your AST logic.
+- **Change the LLM model** — edit `LLMSummarizer.DEFAULT_MODEL`.
+- **Add output formats** — add a branch in `cli.py` and a new renderer method.
+- **Tune classification rules** — edit `_BUGFIX_KEYWORDS` etc. in `classifier.py`.

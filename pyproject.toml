@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "difflog"
+version = "0.1.0"
+description = "Semantic changelog generator powered by git diffs and LLMs"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "click>=8.1",
+    "gitpython>=3.1",
+    "anthropic>=0.25",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.12",
+]
+
+[project.scripts]
+difflog = "difflog.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["difflog*"]
