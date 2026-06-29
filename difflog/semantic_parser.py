@@ -1,7 +1,9 @@
 """Semantic parser.
 
 For Python files: uses ast to detect added/removed/renamed functions,
-classes, and top-level imports.
+classes, imports, and — crucially — function signature changes (argument
+added/removed/renamed/reordered), which are breaking changes even when
+the function name stays the same.
 
 For all other file types: falls back to line-level diff stats and a
 lightweight heuristic scan of the unified diff.
@@ -22,7 +24,7 @@ from .git_interface import FileDiff
 # ------------------------------------------------------------------
 
 SymbolKind = Literal["function", "class", "method", "import"]
-ChangeKind = Literal["added", "removed", "modified", "renamed"]
+ChangeKind = Literal["added", "removed", "modified", "renamed", "signature_changed"]
 
 
 @dataclass
@@ -30,20 +32,52 @@ class SymbolChange:
     kind: SymbolKind
     change: ChangeKind
     name: str
-    old_name: str | None = None   # for renames
-    context: str = ""             # e.g. enclosing class for methods
+    old_name: str | None = None        # for renames
+    old_signature: str | None = None   # for signature changes
+    new_signature: str | None = None   # for signature changes
+    context: str = ""                  # e.g. enclosing class for methods
 
 
 @dataclass
 class SemanticFileSummary:
     path: str
     extension: str
-    file_change_type: str          # from FileDiff
+    file_change_type: str
     lines_added: int
     lines_deleted: int
     symbol_changes: list[SymbolChange] = field(default_factory=list)
     significance: Literal["high", "medium", "low"] = "low"
     notes: list[str] = field(default_factory=list)
+
+
+# ------------------------------------------------------------------
+# Signature helpers
+# ------------------------------------------------------------------
+
+def _get_arg_names(func: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
+    """Return ordered list of argument names, excluding 'self' and 'cls'."""
+    args = func.args
+    all_args = (
+        [a.arg for a in args.posonlyargs]
+        + [a.arg for a in args.args]
+        + ([args.vararg.arg] if args.vararg else [])
+        + [a.arg for a in args.kwonlyargs]
+        + ([args.kwarg.arg] if args.kwarg else [])
+    )
+    return [a for a in all_args if a not in {"self", "cls"}]
+
+
+def _signature_str(func: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    """Human-readable signature: 'name(a, b, c)'."""
+    return f"{func.name}({', '.join(_get_arg_names(func))})"
+
+
+def _signatures_compatible(
+    old_func: ast.FunctionDef | ast.AsyncFunctionDef,
+    new_func: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> bool:
+    """Return True if the public signature is unchanged."""
+    return _get_arg_names(old_func) == _get_arg_names(new_func)
 
 
 # ------------------------------------------------------------------
@@ -53,7 +87,7 @@ class SemanticFileSummary:
 class SemanticParser:
     """Converts a list of FileDiffs into SemanticFileSummarys."""
 
-    RENAME_THRESHOLD = 0.6   # similarity ratio for treating symbols as renamed
+    RENAME_THRESHOLD = 0.6
 
     def parse(self, file_diffs: list[FileDiff]) -> list[SemanticFileSummary]:
         summaries = []
@@ -83,7 +117,14 @@ class SemanticParser:
         old_symbols = self._extract_symbols(old_src, fd.path)
         new_symbols = self._extract_symbols(new_src, fd.path)
 
-        summary.symbol_changes = self._diff_symbols(old_symbols, new_symbols)
+        # Extract full AST nodes for signature comparison
+        old_funcs = self._extract_functions(old_src)
+        new_funcs = self._extract_functions(new_src)
+
+        symbol_changes = self._diff_symbols(old_symbols, new_symbols)
+        sig_changes = self._diff_signatures(old_funcs, new_funcs, old_symbols, new_symbols)
+
+        summary.symbol_changes = symbol_changes + sig_changes
 
         if fd.change_type == "added":
             summary.notes.append("New file added")
@@ -93,7 +134,6 @@ class SemanticParser:
         return summary
 
     def _split_diff_sources(self, raw_diff: str) -> tuple[str, str]:
-        """Reconstruct approximate old and new file contents from a unified diff."""
         old_lines: list[str] = []
         new_lines: list[str] = []
 
@@ -105,14 +145,13 @@ class SemanticParser:
             elif line.startswith("+"):
                 new_lines.append(line[1:])
             else:
-                # context line — present in both
                 old_lines.append(line[1:] if line.startswith(" ") else line)
                 new_lines.append(line[1:] if line.startswith(" ") else line)
 
         return "\n".join(old_lines), "\n".join(new_lines)
 
-    def _extract_symbols(self, source: str, path: str) -> dict[str, SymbolKind]:
-        """Parse Python source and return {qualified_name: kind}."""
+    def _extract_symbols(self, source: str, path: str = "") -> dict[str, SymbolKind]:
+        """Return {qualified_name: kind} for all symbols in source."""
         symbols: dict[str, SymbolKind] = {}
         if not source.strip():
             return symbols
@@ -123,7 +162,6 @@ class SemanticParser:
 
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-                # Determine if it's a method (parent is a class)
                 symbols[node.name] = "function"
             elif isinstance(node, ast.ClassDef):
                 symbols[node.name] = "class"
@@ -139,6 +177,28 @@ class SemanticParser:
 
         return symbols
 
+    def _extract_functions(
+        self, source: str
+    ) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
+        """Return {name: AST node} for every function/method in source."""
+        funcs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+        if not source.strip():
+            return funcs
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return funcs
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                funcs[node.name] = node
+            elif isinstance(node, ast.ClassDef):
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef | ast.AsyncFunctionDef):
+                        funcs[f"{node.name}.{item.name}"] = item
+
+        return funcs
+
     def _diff_symbols(
         self,
         old: dict[str, SymbolKind],
@@ -147,41 +207,61 @@ class SemanticParser:
         changes: list[SymbolChange] = []
         old_names = set(old)
         new_names = set(new)
-
         added = new_names - old_names
         removed = old_names - new_names
 
-        # Detect renames: pair up removed/added symbols of the same kind
-        # with high name-similarity
         matched_added: set[str] = set()
         matched_removed: set[str] = set()
 
         for r in list(removed):
             for a in list(added):
-                if old.get(r) == new.get(a):  # same kind
+                if old.get(r) == new.get(a):
                     ratio = difflib.SequenceMatcher(None, r, a).ratio()
                     if ratio >= self.RENAME_THRESHOLD:
                         changes.append(
-                            SymbolChange(
-                                kind=new[a],
-                                change="renamed",
-                                name=a,
-                                old_name=r,
-                            )
+                            SymbolChange(kind=new[a], change="renamed", name=a, old_name=r)
                         )
                         matched_added.add(a)
                         matched_removed.add(r)
-                        break  # one rename partner per removed symbol
+                        break
 
         for name in added - matched_added:
             changes.append(SymbolChange(kind=new[name], change="added", name=name))
-
         for name in removed - matched_removed:
             changes.append(SymbolChange(kind=old[name], change="removed", name=name))
 
-        # Symbols present in both — count as "modified" if the file itself changed
-        # (we can't easily detect body changes without full source, so we skip
-        # this for now to avoid false positives)
+        return changes
+
+    def _diff_signatures(
+        self,
+        old_funcs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
+        new_funcs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
+        old_symbols: dict[str, SymbolKind],
+        new_symbols: dict[str, SymbolKind],
+    ) -> list[SymbolChange]:
+        """Detect functions that exist in both old and new but changed signature."""
+        changes: list[SymbolChange] = []
+        common = set(old_funcs) & set(new_funcs)
+
+        for name in common:
+            # Skip private functions — signature changes there aren't breaking
+            base_name = name.split(".")[-1]
+            if base_name.startswith("_"):
+                continue
+
+            old_f = old_funcs[name]
+            new_f = new_funcs[name]
+
+            if not _signatures_compatible(old_f, new_f):
+                changes.append(
+                    SymbolChange(
+                        kind="method" if "." in name else "function",
+                        change="signature_changed",
+                        name=name,
+                        old_signature=_signature_str(old_f),
+                        new_signature=_signature_str(new_f),
+                    )
+                )
 
         return changes
 
@@ -202,7 +282,6 @@ class SemanticParser:
             summary.notes.append("Binary file — content diff not available")
             return summary
 
-        # Light heuristics on the diff text
         if fd.extension in {".json", ".yaml", ".yml", ".toml", ".ini", ".env"}:
             summary.notes.append("Configuration file changed")
         elif fd.extension in {".md", ".rst", ".txt"}:
@@ -228,7 +307,8 @@ class SemanticParser:
 
         high_symbol_changes = sum(
             1 for sc in s.symbol_changes
-            if sc.change in {"removed", "renamed"} and sc.kind in {"function", "class"}
+            if sc.change in {"removed", "renamed", "signature_changed"}
+            and sc.kind in {"function", "class", "method"}
         )
         if high_symbol_changes > 0:
             return "high"

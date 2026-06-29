@@ -135,9 +135,9 @@ class ChangeClassifier:
             # Breaking: public symbol removed / renamed
             breaking_symbols = [
                 sc for sc in summary.symbol_changes
-                if sc.change in {"removed", "renamed"}
-                and sc.kind in {"function", "class"}
-                and not sc.name.startswith("_")
+                if sc.change in {"removed", "renamed", "signature_changed"}
+                and sc.kind in {"function", "class", "method"}
+                and not sc.name.split(".")[-1].startswith("_")
             ]
             if breaking_symbols:
                 if "breaking" not in labels:
