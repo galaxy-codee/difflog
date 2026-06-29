@@ -1,12 +1,12 @@
 """Git interface layer.
 
 Wraps gitpython to extract structured diff data between two refs.
-Supports commit hashes, tags, and branch names as --from / --to targets.
+Uses --numstat for accurate line counts (fixes 0 additions/deletions
+bug for newly created files).
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -68,14 +68,12 @@ class GitInterface:
     # ------------------------------------------------------------------
 
     def get_diff(self, from_ref: str, to_ref: str) -> DiffResult:
-        """Return a DiffResult for the range [from_ref..to_ref]."""
         result = DiffResult(from_ref=from_ref, to_ref=to_ref)
         result.commits = self._get_commits(from_ref, to_ref)
         result.file_diffs = self._get_file_diffs(from_ref, to_ref)
         return result
 
     def validate_ref(self, ref: str) -> bool:
-        """Return True if *ref* can be resolved in this repo."""
         try:
             self.repo.commit(ref)
             return True
@@ -87,11 +85,9 @@ class GitInterface:
     # ------------------------------------------------------------------
 
     def _get_commits(self, from_ref: str, to_ref: str) -> list[CommitInfo]:
-        """List commits reachable from to_ref but not from_ref."""
         commits = []
         try:
-            rev_range = f"{from_ref}..{to_ref}"
-            for commit in self.repo.iter_commits(rev_range):
+            for commit in self.repo.iter_commits(f"{from_ref}..{to_ref}"):
                 commits.append(
                     CommitInfo(
                         sha=commit.hexsha,
@@ -106,28 +102,47 @@ class GitInterface:
         return commits
 
     def _get_file_diffs(self, from_ref: str, to_ref: str) -> list[FileDiff]:
-        """Return per-file diff data between the two refs."""
         try:
             base_commit = self.repo.commit(from_ref)
             head_commit = self.repo.commit(to_ref)
         except (git.BadName, git.BadObject, ValueError) as exc:
             raise ValueError(f"Cannot resolve refs: {exc}") from exc
 
-        diffs = base_commit.diff(head_commit)
-        file_diffs: list[FileDiff] = []
+        # --numstat gives accurate added/deleted counts for ALL change types
+        # including new files, deleted files, and binary files
+        numstat = self._get_numstat(from_ref, to_ref)
 
+        diffs = base_commit.diff(head_commit, create_patch=True)
+        file_diffs: list[FileDiff] = []
         for diff_item in diffs:
-            file_diffs.append(self._parse_diff_item(diff_item))
+            file_diffs.append(self._parse_diff_item(diff_item, numstat))
 
         return file_diffs
 
-    def _parse_diff_item(self, item: git.Diff) -> FileDiff:
+    def _get_numstat(self, from_ref: str, to_ref: str) -> dict[str, tuple[int, int]]:
+        """Run git diff --numstat and return {path: (lines_added, lines_deleted)}."""
+        result: dict[str, tuple[int, int]] = {}
+        try:
+            output = self.repo.git.diff("--numstat", from_ref, to_ref)
+            for line in output.splitlines():
+                parts = line.split("\t")
+                if len(parts) == 3:
+                    added_str, deleted_str, path = parts
+                    added   = int(added_str)   if added_str.isdigit()   else 0
+                    deleted = int(deleted_str) if deleted_str.isdigit() else 0
+                    result[path.strip()] = (added, deleted)
+        except Exception:
+            pass
+        return result
+
+    def _parse_diff_item(
+        self, item: git.Diff, numstat: dict[str, tuple[int, int]]
+    ) -> FileDiff:
         change_type = self._change_type(item)
         path = item.b_path or item.a_path or "unknown"
         old_path = item.a_path if change_type == "renamed" else None
         ext = Path(path).suffix.lower()
 
-        # Try to get the unified diff text
         raw_diff = ""
         is_binary = False
         try:
@@ -135,7 +150,11 @@ class GitInterface:
         except Exception:
             is_binary = True
 
-        lines_added, lines_deleted = self._count_lines(raw_diff)
+        # numstat is always correct — use it over _count_lines when available
+        if path in numstat:
+            lines_added, lines_deleted = numstat[path]
+        else:
+            lines_added, lines_deleted = self._count_lines(raw_diff)
 
         return FileDiff(
             path=path,
@@ -160,6 +179,7 @@ class GitInterface:
 
     @staticmethod
     def _count_lines(raw_diff: str) -> tuple[int, int]:
+        """Fallback line counter from unified diff text."""
         added = deleted = 0
         for line in raw_diff.splitlines():
             if line.startswith("+") and not line.startswith("+++"):
